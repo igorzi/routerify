@@ -1,33 +1,33 @@
-use hyper::{
-    header::{self, HeaderValue},
-    Body, Request, Response, Server,
-};
-// Import the routerify prelude traits.
-use routerify::prelude::*;
-use routerify::{Middleware, RequestInfo, Router, RouterService};
+use bytes::Bytes;
+use http::{header, HeaderValue};
+use http_body_util::Full;
+use hyper::{body::Incoming, server::conn::http1, Request, Response};
+use routerify::prelude::RequestExt;
+use routerify::{Middleware, RequestInfo, RequestServiceBuilder, Router};
 use std::io;
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 // A handler for "/" page.
-async fn home_handler(_: Request<Body>) -> Result<Response<Body>, io::Error> {
-    Ok(Response::new(Body::from("Home page")))
+async fn home_handler(_: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
+    Ok(Response::new(Full::from("Home page")))
 }
 
 // A handler for "/about" page.
-async fn about_handler(_: Request<Body>) -> Result<Response<Body>, io::Error> {
-    Ok(Response::new(Body::from("About page")))
+async fn about_handler(_: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
+    Ok(Response::new(Full::from("About page")))
 }
 
 // Define a pre middleware handler which will be executed on every request and
 // logs some meta.
-async fn logger_middleware(req: Request<Body>) -> Result<Request<Body>, io::Error> {
+async fn logger_middleware(req: Request<Incoming>) -> Result<Request<Incoming>, io::Error> {
     println!("{} {} {}", req.remote_addr(), req.method(), req.uri().path());
     Ok(req)
 }
 
 // Define a post middleware handler which will be executed on every request and
 // adds a header to the response.
-async fn my_custom_header_adder_middleware(mut res: Response<Body>) -> Result<Response<Body>, io::Error> {
+async fn my_custom_header_adder_middleware(mut res: Response<Full<Bytes>>) -> Result<Response<Full<Bytes>>, io::Error> {
     res.headers_mut()
         .insert("x-custom-header", HeaderValue::from_static("some value"));
     Ok(res)
@@ -35,7 +35,10 @@ async fn my_custom_header_adder_middleware(mut res: Response<Body>) -> Result<Re
 
 // Define a post middleware handler which will be executed on every request and
 // accesses request information and adds the session cookies to manage session.
-async fn my_session_middleware(mut res: Response<Body>, req_info: RequestInfo) -> Result<Response<Body>, io::Error> {
+async fn my_session_middleware(
+    mut res: Response<Full<Bytes>>,
+    req_info: RequestInfo,
+) -> Result<Response<Full<Bytes>>, io::Error> {
     // Access a cookie.
     let cookie = req_info
         .headers()
@@ -49,7 +52,7 @@ async fn my_session_middleware(mut res: Response<Body>, req_info: RequestInfo) -
     Ok(res)
 }
 
-fn router() -> Router<Body, io::Error> {
+fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
     // Create a router and specify the the handlers.
     Router::builder()
         // Create a pre middleware using `Middleware::pre()` method
@@ -71,17 +74,23 @@ fn router() -> Router<Body, io::Error> {
 async fn main() {
     let router = router();
 
-    // Create a Service from the router above to handle incoming requests.
-    let service = RouterService::new(router).unwrap();
+    // Create a Service builder from the router above to handle incoming requests.
+    let builder = RequestServiceBuilder::new(router).unwrap();
 
     // The address on which the server will be listening.
     let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
 
-    // Create a server by passing the created service to `.serve` method.
-    let server = Server::bind(&addr).serve(service);
+    // Create a TcpListener and bind it to the address.
+    let listener = TcpListener::bind(addr).await.unwrap();
 
-    println!("App is running on: {}", addr);
-    if let Err(err) = server.await {
-        eprintln!("Server error: {}", err);
+    // Start a loop to continuously accept incoming connections.
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = builder.build();
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(stream, service).await {
+                println!("Failed to serve connection: {:?}", err);
+            }
+        });
     }
 }

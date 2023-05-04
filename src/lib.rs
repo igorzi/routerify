@@ -6,7 +6,7 @@
 //!
 //! - 🚀 Fast route matching using [`RegexSet`](https://docs.rs/regex/1.4.3/regex/struct.RegexSet.html)
 //!
-//! - 🍺 Route handlers may return any [HttpBody](https://docs.rs/hyper/0.14.4/hyper/body/trait.HttpBody.html)
+//! - 🍺 Route handlers may return any [Body](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/trait.Body.html)
 //!
 //! - ❗ Flexible [error handling](https://github.com/routerify/routerify/blob/master/examples/error_handling_with_request_info.rs) strategy
 //!

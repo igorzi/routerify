@@ -1,8 +1,9 @@
-use hyper::{
-    body::{self, Body, HttpBody},
-    Server,
-};
-use routerify::{Router, RouterService};
+use http_body_util::BodyExt;
+use hyper::body::Buf;
+use hyper::body::Incoming;
+use hyper::{body::Body, server::conn::http1};
+use routerify::Router;
+use std::io;
 use std::net::SocketAddr;
 use tokio::sync::oneshot::{self, Sender};
 
@@ -12,8 +13,8 @@ pub struct Serve {
 }
 
 impl Serve {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    pub fn addr(&self) -> &SocketAddr {
+        &self.addr
     }
 
     pub fn new_request(&self, method: &str, route: &str) -> http::request::Builder {
@@ -27,30 +28,39 @@ impl Serve {
     }
 }
 
-pub async fn serve<B, E>(router: Router<B, E>) -> Serve
+pub async fn serve<ResponseBody, E>(router: Router<Incoming, ResponseBody, E>) -> Serve
 where
-    B: HttpBody + Send + Sync + 'static,
+    ResponseBody: Body + Send + Sync + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
-    <B as HttpBody>::Data: Send + Sync + 'static,
-    <B as HttpBody>::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    <ResponseBody as Body>::Data: Send + Sync + 'static,
+    <ResponseBody as Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
-    let service = RouterService::new(router).unwrap();
-    let server = Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
-    let addr = server.local_addr();
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let builder = routerify::RequestServiceBuilder::new(router).unwrap();
+    let (tx, mut rx) = oneshot::channel::<()>();
 
-    let (tx, rx) = oneshot::channel::<()>();
-
-    let graceful_server = server.with_graceful_shutdown(async {
-        rx.await.unwrap();
+    tokio::task::spawn(async move {
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    let (stream, _) = res.unwrap();
+                    let service = builder.build();
+                    tokio::task::spawn(async move {
+                        http1::Builder::new().serve_connection(stream, service).await.unwrap();
+                    });
+                }
+                _ = &mut rx => {
+                    break;
+                }
+            }
+        }
     });
-
-    tokio::spawn(async move {
-        graceful_server.await.unwrap();
-    });
-
     Serve { addr, tx }
 }
 
-pub async fn into_text(body: Body) -> String {
-    String::from_utf8_lossy(&body::to_bytes(body).await.unwrap()).to_string()
+pub async fn into_text(body: Incoming) -> String {
+    let body = body.collect().await.unwrap().aggregate();
+    io::read_to_string(body.reader()).unwrap()
 }

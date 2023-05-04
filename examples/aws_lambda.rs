@@ -7,7 +7,8 @@ use aws_lambda_events::{
         ApiGatewayProxyRequestContext, ApiGatewayV2httpRequestContext, ApiGatewayV2httpRequestContextHttpDescription,
     },
 };
-use futures::future::poll_fn;
+use bytes::{Buf, Bytes};
+use http_body_util::{BodyExt, Full};
 use hyper::service::Service;
 use lambda_http::{
     handler,
@@ -47,12 +48,11 @@ async fn entrypoint(req: Request, _ctx: Context) -> Result<impl IntoResponse, Ha
 
     // Convert the lambda_http::Request into a hyper::Request, replacing the URI
     // with the local address of the routerify server.
-    let remote_addr = get_remote_addr(&req);
     let (mut parts, body) = req.into_parts();
     let body = match body {
-        Body::Empty => hyper::Body::empty(),
-        Body::Text(t) => hyper::Body::from(t.into_bytes()),
-        Body::Binary(b) => hyper::Body::from(b),
+        Body::Empty => Full::default(),
+        Body::Text(t) => Full::from(t.into_bytes()),
+        Body::Binary(b) => Full::from(b),
     };
     let mut uri = format!("http://{}{}", SERVER_ADDR, parts.uri.path());
 
@@ -73,25 +73,22 @@ async fn entrypoint(req: Request, _ctx: Context) -> Result<impl IntoResponse, Ha
     debug!(logger, "lambda request: {:#?}", req);
     debug!(logger, "request uri path: {}", req.uri().path());
 
-    let router: Router<hyper::body::Body, routerify::Error> = Router::builder()
+    let router: Router<Full<Bytes>, Full<Bytes>, routerify::Error> = Router::builder()
         .get("/", |_| async move { Ok(Response::new("Hello, world!".into())) })
         .build()
         .unwrap();
 
     let builder = RequestServiceBuilder::new(router)?;
-    let mut service = builder.build(remote_addr);
-    if let Err(e) = poll_fn(|ctx| service.poll_ready(ctx)).await {
-        panic!("request service is not ready: {:?}", e);
-    }
-    let resp: Response<hyper::body::Body> = service.call(req).await?;
+    let mut service = builder.build();
+    let resp = service.call(req).await?;
 
     // Parse the hyper::Request from Routerify into a lambda_http::Request
     let (parts, body) = resp.into_parts();
-    let body_bytes = hyper::body::to_bytes(body).await?;
-    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    let body = std::io::read_to_string(body.collect().await?.aggregate().reader())?;
     Ok(Response::from_parts(parts, Body::from(body)))
 }
 
+#[allow(dead_code)]
 fn get_remote_addr(req: &Request) -> SocketAddr {
     const PORT: u16 = 8080;
     let source_ip: String = match req.request_context() {

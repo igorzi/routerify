@@ -1,8 +1,11 @@
-use hyper::{Body, Response, Server};
-use routerify::{Middleware, Router, RouterService};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{body::Incoming, server::conn::http1, Response};
+use routerify::{Middleware, RequestServiceBuilder, Router};
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
-fn router() -> Router<Body, routerify::Error> {
+fn router() -> Router<Incoming, Full<Bytes>, routerify::Error> {
     let mut builder = Router::builder();
 
     for i in 0..3000_usize {
@@ -16,7 +19,7 @@ fn router() -> Router<Body, routerify::Error> {
 
         builder = builder.get(format!("/abc-{}", i), move |_req| async move {
             // println!("Route: {}, params: {:?}", format!("/abc-{}", i), req.params());
-            Ok(Response::new(Body::from(format!("/abc-{}", i))))
+            Ok(Response::new(Full::from(format!("/abc-{}", i))))
         });
 
         builder = builder.middleware(
@@ -35,13 +38,23 @@ fn router() -> Router<Body, routerify::Error> {
 async fn main() {
     let router = router();
 
-    let service = RouterService::new(router).unwrap();
+    // Create a Service builder from the router above to handle incoming requests.
+    let builder = RequestServiceBuilder::new(router).unwrap();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    let server = Server::bind(&addr).serve(service);
+    // The address on which the server will be listening.
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
 
-    println!("App is running on: {}", addr);
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+    // Create a TcpListener and bind it to the address.
+    let listener = TcpListener::bind(addr).await.unwrap();
+
+    // Start a loop to continuously accept incoming connections.
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = builder.build();
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(stream, service).await {
+                println!("Failed to serve connection: {:?}", err);
+            }
+        });
     }
 }

@@ -1,13 +1,17 @@
-use hyper::{Body, Request, Response, Server};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::{Request, Response};
 // Import the routerify prelude traits.
-use routerify::prelude::*;
-use routerify::{Router, RouterService};
+use routerify::{prelude::*, RequestServiceBuilder, Router};
 use std::io;
 use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 // A handler for "/" page.
-async fn home_handler(_: Request<Body>) -> Result<Response<Body>, io::Error> {
-    Ok(Response::new(Body::from("Home page")))
+async fn home_handler(_: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
+    Ok(Response::new(Full::from("Home page")))
 }
 
 // Define a different module which will have only API related handlers.
@@ -16,17 +20,17 @@ mod api {
 
     // Define a handler for "/users/:userName/books/:bookName" API endpoint which will have two
     // route parameters: `userName` and `bookName`.
-    async fn user_book_handler(req: Request<Body>) -> Result<Response<Body>, io::Error> {
+    async fn user_book_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
         let user_name = req.param("userName").unwrap();
         let book_name = req.param("bookName").unwrap();
 
-        Ok(Response::new(Body::from(format!(
+        Ok(Response::new(Full::from(format!(
             "User: {}, Book: {}",
             user_name, book_name
         ))))
     }
 
-    pub fn router() -> Router<Body, io::Error> {
+    pub fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
         // Create a router for API and specify the the handlers.
         Router::builder()
             .get("/users/:userName/books/:bookName", user_book_handler)
@@ -35,7 +39,7 @@ mod api {
     }
 }
 
-fn router() -> Router<Body, io::Error> {
+fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
     // Create a root router and specify the the handlers.
     Router::builder()
         .get("/", home_handler)
@@ -50,17 +54,23 @@ fn router() -> Router<Body, io::Error> {
 async fn main() {
     let router = router();
 
-    // Create a Service from the router above to handle incoming requests.
-    let service = RouterService::new(router).unwrap();
+    // Create a Service builder from the router above to handle incoming requests.
+    let builder = RequestServiceBuilder::new(router).unwrap();
 
     // The address on which the server will be listening.
     let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
 
-    // Create a server by passing the created service to `.serve` method.
-    let server = Server::bind(&addr).serve(service);
+    // Create a TcpListener and bind it to the address.
+    let listener = TcpListener::bind(addr).await.unwrap();
 
-    println!("App is running on: {}", addr);
-    if let Err(err) = server.await {
-        eprintln!("Server error: {}", err);
+    // Start a loop to continuously accept incoming connections.
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = builder.build();
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(stream, service).await {
+                println!("Failed to serve connection: {:?}", err);
+            }
+        });
     }
 }

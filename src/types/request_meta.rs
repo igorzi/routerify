@@ -15,6 +15,7 @@ impl RequestMeta {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_remote_addr(remote_addr: SocketAddr) -> RequestMeta {
         RequestMeta {
             route_params: None,

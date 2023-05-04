@@ -1,10 +1,14 @@
-use hyper::{Body, Request, Response, Server};
+use hyper::server::conn::http1;
+use hyper::{Request, Response};
 // Import the routerify prelude traits.
-use routerify::prelude::*;
-use routerify::{Router, RouterService};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use routerify::{prelude::*, RequestServiceBuilder, Router};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
 
 mod users {
     use super::*;
@@ -13,12 +17,12 @@ mod users {
         count: Arc<Mutex<u8>>,
     }
 
-    async fn list(req: Request<Body>) -> Result<Response<Body>, io::Error> {
+    async fn list(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
         let count = req.data::<State>().unwrap().count.lock().unwrap();
-        Ok(Response::new(Body::from(format!("Suppliers: {}", count))))
+        Ok(Response::new(Full::from(format!("Suppliers: {}", count))))
     }
 
-    pub fn router() -> Router<Body, io::Error> {
+    pub fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
         let state = State {
             count: Arc::new(Mutex::new(20)),
         };
@@ -33,15 +37,15 @@ mod offers {
         count: Arc<Mutex<u8>>,
     }
 
-    async fn list(req: Request<Body>) -> Result<Response<Body>, io::Error> {
+    async fn list(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
         let count = req.data::<State>().unwrap().count.lock().unwrap();
 
         println!("I can also access parent state: {:?}", req.data::<String>().unwrap());
 
-        Ok(Response::new(Body::from(format!("Suppliers: {}", count))))
+        Ok(Response::new(Full::from(format!("Suppliers: {}", count))))
     }
 
-    pub fn router() -> Router<Body, io::Error> {
+    pub fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
         let state = State {
             count: Arc::new(Mutex::new(100)),
         };
@@ -61,11 +65,17 @@ async fn main() {
     let router = Router::builder().scope("/v1", scopes).build().unwrap();
     dbg!(&router);
 
-    let service = RouterService::new(router).unwrap();
+    let builder = RequestServiceBuilder::new(router).unwrap();
     let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
-    let server = Server::bind(&addr).serve(service);
-    println!("App is running on: {}", addr);
-    if let Err(err) = server.await {
-        eprintln!("Server error: {}", err);
+    let listener = TcpListener::bind(addr).await.unwrap();
+    println!("App is running on: {}", listener.local_addr().unwrap());
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let service = builder.build();
+        tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new().serve_connection(stream, service).await {
+                println!("Failed to serve connection: {:?}", err);
+            }
+        });
     }
 }

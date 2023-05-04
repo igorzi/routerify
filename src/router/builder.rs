@@ -5,17 +5,20 @@ use crate::route::Route;
 use crate::router::Router;
 use crate::router::{ErrHandler, ErrHandlerWithInfo, ErrHandlerWithoutInfo};
 use crate::types::RequestInfo;
-use hyper::{body::HttpBody, Method, Request, Response};
+use hyper::{body::Body, Method, Request, Response};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 /// Builder for the [Router](./struct.Router.html) type.
 ///
-/// This `RouterBuilder<B, E>` type accepts two type parameters: `B` and `E`.
+/// This `RouterBuilder<RequestBody, ResponseBody, E>` type accepts two type parameters: `B` and `E`.
 ///
-/// * The `B` represents the response body type which will be used by route handlers and the middlewares and this body type must implement
-///   the [HttpBody](https://docs.rs/hyper/0.14.4/hyper/body/trait.HttpBody.html) trait. For an instance, `B` could be [hyper::Body](https://docs.rs/hyper/0.14.4/hyper/body/struct.Body.html)
+/// * The `RequestBody` represents the response body type which will be used by route handlers and the middlewares and this body type must implement
+///   the [hyper::body::Body](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/trait.Body.html) trait. For an instance, `RequestBody` could be [hyper::body::Incoming](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/struct.Incoming.html)
+///   type.
+/// * The `ResponseBody` represents the response body type which will be used by route handlers and the middlewares and this body type must implement
+///   the [hyper::body::Body](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/trait.Body.html) trait. For an instance, `ResponseBody` could be [http_body_util::Full](https://docs.rs/http-body-util/0.1.0-rc.2/http_body_util/struct.Full.html)
 ///   type.
 /// * The `E` represents any error type which will be used by route handlers and the middlewares. This error type must implement the [std::error::Error](https://doc.rust-lang.org/std/error/trait.Error.html).
 ///
@@ -50,28 +53,31 @@ use std::sync::Arc;
 /// # }
 /// # run();
 /// ```
-pub struct RouterBuilder<B, E> {
-    inner: crate::Result<BuilderInner<B, E>>,
+pub struct RouterBuilder<RequestBody, ResponseBody, E> {
+    inner: crate::Result<BuilderInner<RequestBody, ResponseBody, E>>,
 }
 
-struct BuilderInner<B, E> {
-    pre_middlewares: Vec<PreMiddleware<E>>,
-    routes: Vec<Route<B, E>>,
-    post_middlewares: Vec<PostMiddleware<B, E>>,
+struct BuilderInner<RequestBody, ResponseBody, E> {
+    pre_middlewares: Vec<PreMiddleware<RequestBody, E>>,
+    routes: Vec<Route<RequestBody, ResponseBody, E>>,
+    post_middlewares: Vec<PostMiddleware<ResponseBody, E>>,
     data_maps: HashMap<String, Vec<DataMap>>,
-    err_handler: Option<ErrHandler<B>>,
+    err_handler: Option<ErrHandler<ResponseBody>>,
 }
 
-impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static>
-    RouterBuilder<B, E>
+impl<
+        RequestBody: Body + Send + Sync + 'static,
+        ResponseBody: Body + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    > RouterBuilder<RequestBody, ResponseBody, E>
 {
     /// Creates a new `RouterBuilder` instance with default options.
-    pub fn new() -> RouterBuilder<B, E> {
+    pub fn new() -> RouterBuilder<RequestBody, ResponseBody, E> {
         RouterBuilder::default()
     }
 
     /// Creates a new [Router](./struct.Router.html) instance from the added configuration.
-    pub fn build(self) -> crate::Result<Router<B, E>> {
+    pub fn build(self) -> crate::Result<Router<RequestBody, ResponseBody, E>> {
         self.inner.and_then(|inner| {
             let scoped_data_maps = inner
                 .data_maps
@@ -97,7 +103,9 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
 
     fn and_then<F>(self, func: F) -> Self
     where
-        F: FnOnce(BuilderInner<B, E>) -> crate::Result<BuilderInner<B, E>>,
+        F: FnOnce(
+            BuilderInner<RequestBody, ResponseBody, E>,
+        ) -> crate::Result<BuilderInner<RequestBody, ResponseBody, E>>,
     {
         RouterBuilder {
             inner: self.inner.and_then(func),
@@ -105,8 +113,11 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     }
 }
 
-impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static>
-    RouterBuilder<B, E>
+impl<
+        RequestBody: Body + Send + Sync + 'static,
+        ResponseBody: Body + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    > RouterBuilder<RequestBody, ResponseBody, E>
 {
     /// Adds a new route with `GET` method and the handler at the specified path.
     ///
@@ -132,8 +143,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn get<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::GET], handler)
     }
@@ -162,8 +173,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn get_or_head<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::GET, Method::HEAD], handler)
     }
@@ -192,8 +203,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn post<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::POST], handler)
     }
@@ -222,8 +233,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn put<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::PUT], handler)
     }
@@ -252,8 +263,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn delete<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::DELETE], handler)
     }
@@ -282,8 +293,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn head<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::HEAD], handler)
     }
@@ -312,8 +323,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn trace<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::TRACE], handler)
     }
@@ -342,8 +353,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn connect<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::CONNECT], handler)
     }
@@ -372,8 +383,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn patch<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::PATCH], handler)
     }
@@ -402,8 +413,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn options<P, H, R>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, vec![Method::OPTIONS], handler)
     }
@@ -442,8 +453,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     /// ```
     pub fn any<H, R>(self, handler: H) -> Self
     where
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add("/*", constants::ALL_POSSIBLE_HTTP_METHODS.to_vec(), handler)
     }
@@ -473,8 +484,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn any_method<H, R, P>(self, path: P, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.add(path, constants::ALL_POSSIBLE_HTTP_METHODS.to_vec(), handler)
     }
@@ -503,8 +514,8 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn add<P, H, R>(self, path: P, methods: Vec<Method>, handler: H) -> Self
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
         self.and_then(move |mut inner| {
             let mut path = path.into();
@@ -553,7 +564,7 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     /// ```
     ///
     /// Now, the app can handle requests on: `/api/users` and `/api/books` paths.
-    pub fn scope<P>(self, path: P, mut router: Router<B, E>) -> Self
+    pub fn scope<P>(self, path: P, mut router: Router<RequestBody, ResponseBody, E>) -> Self
     where
         P: Into<String>,
     {
@@ -636,8 +647,11 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     }
 }
 
-impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static>
-    RouterBuilder<B, E>
+impl<
+        RequestBody: Body + Send + Sync + 'static,
+        ResponseBody: Body + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    > RouterBuilder<RequestBody, ResponseBody, E>
 {
     /// Adds a single middleware. A pre middleware can be created by [`Middleware::pre`](./enum.Middleware.html#method.pre) method and a post
     /// middleware can be created by [`Middleware::post`](./enum.Middleware.html#method.post) method.
@@ -661,7 +675,7 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     /// # }
     /// # run();
     /// ```
-    pub fn middleware(self, m: Middleware<B, E>) -> Self {
+    pub fn middleware(self, m: Middleware<RequestBody, ResponseBody, E>) -> Self {
         self.and_then(move |mut inner| {
             match m {
                 Middleware::Pre(middleware) => {
@@ -701,9 +715,10 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn err_handler<H, R>(self, handler: H) -> Self
     where
         H: Fn(crate::RouteError) -> R + Send + Sync + 'static,
-        R: Future<Output = Response<B>> + Send + 'static,
+        R: Future<Output = Response<ResponseBody>> + Send + 'static,
     {
-        let handler: ErrHandlerWithoutInfo<B> = Box::new(move |err: crate::RouteError| Box::new(handler(err)));
+        let handler: ErrHandlerWithoutInfo<ResponseBody> =
+            Box::new(move |err: crate::RouteError| Box::new(handler(err)));
 
         self.and_then(move |mut inner| {
             inner.err_handler = Some(ErrHandler::WithoutInfo(handler));
@@ -720,9 +735,9 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     pub fn err_handler_with_info<H, R>(self, handler: H) -> Self
     where
         H: Fn(crate::RouteError, RequestInfo) -> R + Send + Sync + 'static,
-        R: Future<Output = Response<B>> + Send + 'static,
+        R: Future<Output = Response<ResponseBody>> + Send + 'static,
     {
-        let handler: ErrHandlerWithInfo<B> =
+        let handler: ErrHandlerWithInfo<ResponseBody> =
             Box::new(move |err: crate::RouteError, req_info: RequestInfo| Box::new(handler(err, req_info)));
 
         self.and_then(move |mut inner| {
@@ -732,10 +747,13 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     }
 }
 
-impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static> Default
-    for RouterBuilder<B, E>
+impl<
+        RequestBody: Body + Send + Sync + 'static,
+        ResponseBody: Body + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    > Default for RouterBuilder<RequestBody, ResponseBody, E>
 {
-    fn default() -> RouterBuilder<B, E> {
+    fn default() -> RouterBuilder<RequestBody, ResponseBody, E> {
         RouterBuilder {
             inner: Ok(BuilderInner {
                 pre_middlewares: Vec::new(),

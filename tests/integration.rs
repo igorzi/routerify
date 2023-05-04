@@ -1,31 +1,43 @@
 use self::support::{into_text, serve};
-use hyper::{Body, Client, Request, Response, StatusCode};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::client::conn::http1::{self, SendRequest};
+use hyper::{Request, Response, StatusCode};
 use routerify::prelude::RequestExt;
 use routerify::{Middleware, RequestInfo, RouteError, Router};
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tokio::net::TcpStream;
 
 mod support;
+
+async fn tcp_conn(addr: &SocketAddr) -> SendRequest<Full<Bytes>> {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (sender, conn) = http1::handshake::<_, Full<Bytes>>(stream).await.unwrap();
+    tokio::task::spawn(async move {
+        conn.await.unwrap();
+    });
+    sender
+}
 
 #[tokio::test]
 async fn can_perform_simple_get_request() {
     const RESPONSE_TEXT: &str = "Hello world";
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .get("/", |_| async move { Ok(Response::new(RESPONSE_TEXT.into())) })
         .err_handler(|_: RouteError| async move { todo!() })
         .build()
         .unwrap();
     let serve = serve(router).await;
-    let resp = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", serve.addr()))
+        .body(Full::<Bytes>::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
     let resp = into_text(resp.into_body()).await;
     assert_eq!(resp, RESPONSE_TEXT.to_owned());
     serve.shutdown();
@@ -35,22 +47,19 @@ async fn can_perform_simple_get_request() {
 async fn can_perform_simple_get_request_boxed_error() {
     const RESPONSE_TEXT: &str = "Hello world";
     type BoxedError = Box<dyn std::error::Error + Sync + Send + 'static>;
-    let router: Router<Body, BoxedError> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, BoxedError> = Router::builder()
         .get("/", |_| async move { Ok(Response::new(RESPONSE_TEXT.into())) })
         .err_handler(|_: RouteError| async move { todo!() })
         .build()
         .unwrap();
     let serve = serve(router).await;
-    let resp = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", serve.addr()))
+        .body(Full::<Bytes>::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
     let resp = into_text(resp.into_body()).await;
     assert_eq!(resp, RESPONSE_TEXT.to_owned());
     serve.shutdown();
@@ -64,11 +73,11 @@ async fn can_respond_with_data_from_scope_state() {
         struct State {
             count: Arc<Mutex<u8>>,
         }
-        async fn list(req: Request<Body>) -> Result<Response<Body>, io::Error> {
+        async fn list(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
             let count = req.data::<State>().unwrap().count.lock().unwrap();
-            Ok(Response::new(Body::from(format!("{}", count))))
+            Ok(Response::new(Full::from(format!("{}", count))))
         }
-        pub fn router() -> Router<Body, io::Error> {
+        pub fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
             let state = State {
                 count: Arc::new(Mutex::new(1)),
             };
@@ -78,14 +87,15 @@ async fn can_respond_with_data_from_scope_state() {
 
     mod service2 {
         use super::*;
+        use routerify::prelude::RequestExt;
         struct State {
             count: Arc<Mutex<u8>>,
         }
-        async fn list(req: Request<Body>) -> Result<Response<Body>, io::Error> {
+        async fn list(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, io::Error> {
             let count = req.data::<State>().unwrap().count.lock().unwrap();
-            Ok(Response::new(Body::from(format!("{}", count))))
+            Ok(Response::new(Full::from(format!("{}", count))))
         }
-        pub fn router() -> Router<Body, io::Error> {
+        pub fn router() -> Router<Incoming, Full<Bytes>, io::Error> {
             let state = State {
                 count: Arc::new(Mutex::new(2)),
             };
@@ -105,20 +115,24 @@ async fn can_respond_with_data_from_scope_state() {
         .build()
         .unwrap();
     let serve = serve(router).await;
+    let mut sender = tcp_conn(serve.addr()).await;
+
+    let req = serve
+        .new_request("GET", "/v1/service1")
+        .body(Full::<Bytes>::default())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
 
     // Ensure response contains service1's unique data.
-    let resp = Client::new()
-        .request(serve.new_request("GET", "/v1/service1").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
     assert_eq!(200, resp.status().as_u16());
     assert_eq!("1", into_text(resp.into_body()).await);
 
     // Ensure response contains service2's unique data.
-    let resp = Client::new()
-        .request(serve.new_request("GET", "/v1/service2").body(Body::empty()).unwrap())
-        .await
+    let req = serve
+        .new_request("GET", "/v1/service2")
+        .body(Full::<Bytes>::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
     assert_eq!(200, resp.status().as_u16());
     assert_eq!(into_text(resp.into_body()).await, "2");
 
@@ -133,14 +147,14 @@ async fn can_propagate_request_context() {
     #[derive(Debug, Clone, PartialEq)]
     struct Id2(u32);
 
-    let before = |req: Request<Body>| async move {
+    let before = |req: Request<Incoming>| async move {
         req.set_context(Id(42));
         let (parts, body) = req.into_parts();
         parts.set_context(Id2(42));
         Ok(Request::from_parts(parts, body))
     };
 
-    let index = |req: Request<Body>| async move {
+    let index = |req: Request<Incoming>| async move {
         // Check `id` from `before()`.
         let id = req.context::<Id>().unwrap();
         assert_eq!(id, Id(42));
@@ -181,7 +195,7 @@ async fn can_propagate_request_context() {
 
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Something went wrong"))
+            .body(Full::from("Something went wrong"))
             .unwrap()
     };
 
@@ -201,32 +215,29 @@ async fn can_propagate_request_context() {
         Ok(res)
     };
 
-    let router: Router<Body, std::io::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, std::io::Error> = Router::builder()
         .middleware(Middleware::pre(before))
         .middleware(Middleware::post_with_info(after))
         .err_handler_with_info(error_handler)
         .get("/", index)
         .build()
         .unwrap();
-    let serve = serve(router).await;
-    let _ = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
 
+    let serve = serve(router).await;
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", serve.addr()))
+        .body(Full::default())
+        .unwrap();
+    let _ = sender.send_request(req).await.unwrap();
     serve.shutdown();
 }
 
 #[tokio::test]
 async fn can_extract_path_params() {
     const RESPONSE_TEXT: &str = "Hello world";
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .get("/api/:first/plus/:second", |req| async move {
             let first = req.param("first").unwrap();
             let second = req.param("second").unwrap();
@@ -242,16 +253,13 @@ async fn can_extract_path_params() {
         .build()
         .unwrap();
     let serve = serve(router).await;
-    let resp = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/api/40/plus/2", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/api/40/plus/2", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
     let resp = into_text(resp.into_body()).await;
     assert_eq!(resp, RESPONSE_TEXT.to_owned());
     serve.shutdown();
@@ -260,7 +268,7 @@ async fn can_extract_path_params() {
 #[tokio::test]
 async fn can_extract_extension_path_params_1() {
     const RESPONSE_TEXT: &str = "Hello world";
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .get("/api/:id.json", |req| async move {
             let id = req.param("id").unwrap();
             assert_eq!(id, "40");
@@ -272,16 +280,13 @@ async fn can_extract_extension_path_params_1() {
         .build()
         .unwrap();
     let serve = serve(router).await;
-    let resp = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/api/40.json", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/api/40.json", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
     let resp = into_text(resp.into_body()).await;
     assert_eq!(resp, RESPONSE_TEXT.to_owned());
     serve.shutdown();
@@ -290,7 +295,7 @@ async fn can_extract_extension_path_params_1() {
 #[tokio::test]
 async fn can_extract_extension_path_params_2() {
     const RESPONSE_TEXT: &str = "Hello world";
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .get("/api/:fileName", |req| async move {
             let file_name = req.param("fileName").unwrap();
             assert_eq!(file_name, "data.json");
@@ -302,16 +307,13 @@ async fn can_extract_extension_path_params_2() {
         .build()
         .unwrap();
     let serve = serve(router).await;
-    let resp = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/api/data.json", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/api/data.json", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
     let resp = into_text(resp.into_body()).await;
     assert_eq!(resp, RESPONSE_TEXT.to_owned());
     serve.shutdown();
@@ -319,14 +321,14 @@ async fn can_extract_extension_path_params_2() {
 
 #[tokio::test]
 async fn do_not_execute_scoped_middleware_for_unscoped_path() {
-    let api_router: Router<Body, routerify::Error> = Router::builder()
+    let api_router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .middleware(Middleware::pre(|_| async { panic!("should not be executed") }))
         .middleware(Middleware::post(|_| async { panic!("should not be executed") }))
         .get("/api/todo", |_| async { Ok(Response::new("".into())) })
         .build()
         .unwrap();
 
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .get("/", |_| async { Ok(Response::new("".into())) })
         .scope("/api", api_router)
         .get("/api/login", |_| async { Ok(Response::new("".into())) })
@@ -334,16 +336,13 @@ async fn do_not_execute_scoped_middleware_for_unscoped_path() {
         .unwrap();
 
     let serve = serve(router).await;
-    let _ = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/api/login", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/api/login", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    sender.send_request(req).await.unwrap();
     serve.shutdown();
 }
 
@@ -359,7 +358,7 @@ async fn execute_scoped_middleware_when_no_unscoped_match() {
     let executed_post = Arc::new(ExecPost(AtomicBool::new(false)));
 
     // Record the execution of pre and post middleware.
-    let api_router: Router<Body, routerify::Error> = Router::builder()
+    let api_router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .middleware(Middleware::pre(|req| async {
             let pre = req.data::<Arc<ExecPre>>().unwrap();
             pre.0.store(true, SeqCst);
@@ -374,7 +373,7 @@ async fn execute_scoped_middleware_when_no_unscoped_match() {
         .build()
         .unwrap();
 
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .data(executed_pre.clone())
         .data(executed_post.clone())
         .get("/", |_| async { Ok(Response::new("".into())) })
@@ -384,16 +383,13 @@ async fn execute_scoped_middleware_when_no_unscoped_match() {
         .unwrap();
 
     let serve = serve(router).await;
-    let _ = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/api/nomatch", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/api/nomatch", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    sender.send_request(req).await.unwrap();
 
     assert!(executed_pre.0.load(SeqCst));
     assert!(executed_post.0.load(SeqCst));
@@ -417,31 +413,27 @@ async fn can_handle_custom_errors() {
     }
 
     const RESPONSE_TEXT: &str = "Something went wrong!";
-    let router: Router<Body, ApiError> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, ApiError> = Router::builder()
         .get("/", |_| async move { Err(ApiError::Generic(RESPONSE_TEXT.into())) })
         .err_handler(|err: RouteError| async move {
             let api_err = err.downcast::<ApiError>().unwrap();
             match api_err.as_ref() {
                 ApiError::Generic(s) => Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(s.to_string()))
+                    .body(Full::from(s.to_string()))
                     .unwrap(),
             }
         })
         .build()
         .unwrap();
     let serve = serve(router).await;
-
-    let resp = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}/", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}/", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let resp = into_text(resp.into_body()).await;
@@ -460,7 +452,7 @@ async fn can_handle_pre_middleware_errors() {
     // If pre middleware fails, then `data` and `req.context` should
     // propagate to the error handler and post middleware. The route
     // handler should not be executed.
-    let router: Router<Body, routerify::Error> = Router::builder()
+    let router: Router<Incoming, Full<Bytes>, routerify::Error> = Router::builder()
         .data(state)
         .middleware(Middleware::pre(|req| async move {
             req.set_context(Ctx(42));
@@ -471,7 +463,7 @@ async fn can_handle_pre_middleware_errors() {
             let _state = req_info.data::<State>().expect("No state");
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from(err.to_string()))
+                .body(Full::from(err.to_string()))
                 .unwrap()
         })
         .middleware(Middleware::post_with_info(|resp, req_info| async move {
@@ -484,15 +476,12 @@ async fn can_handle_pre_middleware_errors() {
         .unwrap();
 
     let serve = serve(router).await;
-    let _ = Client::new()
-        .request(
-            Request::builder()
-                .method("GET")
-                .uri(format!("http://{}", serve.addr()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let mut sender = tcp_conn(serve.addr()).await;
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{}", serve.addr()))
+        .body(Full::default())
         .unwrap();
+    sender.send_request(req).await.unwrap();
     serve.shutdown();
 }

@@ -2,24 +2,28 @@ use crate::helpers;
 use crate::regex_generator::generate_exact_match_regex;
 use crate::types::{RequestMeta, RouteParams};
 use crate::Error;
-use hyper::{body::HttpBody, Method, Request, Response};
+use hyper::{body::Body, Method, Request, Response};
 use regex::Regex;
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
-type Handler<B, E> = Box<dyn Fn(Request<hyper::Body>) -> HandlerReturn<B, E> + Send + Sync + 'static>;
-type HandlerReturn<B, E> = Box<dyn Future<Output = Result<Response<B>, E>> + Send + 'static>;
+type Handler<RequestBody, ResponseBody, E> =
+    Box<dyn Fn(Request<RequestBody>) -> HandlerReturn<ResponseBody, E> + Send + Sync + 'static>;
+type HandlerReturn<ResponseBody, E> = Box<dyn Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static>;
 
 /// Represents a single route.
 ///
 /// A route consists of a path, http method type(s) and a handler. It shouldn't be created directly, use [RouterBuilder](./struct.RouterBuilder.html) methods
 /// to create a route.
 ///
-/// This `Route<B, E>` type accepts two type parameters: `B` and `E`.
+/// This `Route<RequestBody, ResponseBody, E>` type accepts two type parameters: `B` and `E`.
 ///
-/// * The `B` represents the response body type which will be used by route handlers and the middlewares and this body type must implement
-///   the [HttpBody](https://docs.rs/hyper/0.14.4/hyper/body/trait.HttpBody.html) trait. For an instance, `B` could be [hyper::Body](https://docs.rs/hyper/0.14.4/hyper/body/struct.Body.html)
+/// * The `RequestBody` represents the response body type which will be used by route handlers and the middlewares and this body type must implement
+///   the [hyper::body::Body](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/trait.Body.html) trait. For an instance, `RequestBody` could be [hyper::body::Incoming](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/struct.Incoming.html)
+///   type.
+/// * The `ResponseBody` represents the response body type which will be used by route handlers and the middlewares and this body type must implement
+///   the [hyper::body::Body](https://docs.rs/hyper/1.0.0-rc.3/hyper/body/trait.Body.html) trait. For an instance, `ResponseBody` could be [http_body_util::Full](https://docs.rs/http-body-util/0.1.0-rc.2/http_body_util/struct.Full.html)
 ///   type.
 /// * The `E` represents any error type which will be used by route handlers and the middlewares. This error type must implement the [std::error::Error](https://doc.rust-lang.org/std/error/trait.Error.html).
 ///
@@ -43,25 +47,30 @@ type HandlerReturn<B, E> = Box<dyn Future<Output = Result<Response<B>, E>> + Sen
 /// # }
 /// # run();
 /// ```
-pub struct Route<B, E> {
+pub struct Route<RequestBody, ResponseBody, E> {
     pub(crate) path: String,
     pub(crate) regex: Regex,
     route_params: Vec<String>,
     // Make it an option so that when a router is used to scope in another router,
     // It can be extracted out by 'opt.take()' without taking the whole router's ownership.
-    pub(crate) handler: Option<Handler<B, E>>,
+    pub(crate) handler: Option<Handler<RequestBody, ResponseBody, E>>,
     pub(crate) methods: Vec<Method>,
     // Scope depth with regards to the top level router.
     pub(crate) scope_depth: u32,
 }
 
-impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static> Route<B, E> {
+impl<
+        RequestBody: Body + Send + Sync + 'static,
+        ResponseBody: Body + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    > Route<RequestBody, ResponseBody, E>
+{
     pub(crate) fn new_with_boxed_handler<P: Into<String>>(
         path: P,
         methods: Vec<Method>,
-        handler: Handler<B, E>,
+        handler: Handler<RequestBody, ResponseBody, E>,
         scope_depth: u32,
-    ) -> crate::Result<Route<B, E>> {
+    ) -> crate::Result<Route<RequestBody, ResponseBody, E>> {
         let path = path.into();
         let (re, params) = generate_exact_match_regex(path.as_str()).map_err(|e| {
             Error::new(format!(
@@ -80,13 +89,18 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
         })
     }
 
-    pub(crate) fn new<P, H, R>(path: P, methods: Vec<Method>, handler: H) -> crate::Result<Route<B, E>>
+    pub(crate) fn new<P, H, R>(
+        path: P,
+        methods: Vec<Method>,
+        handler: H,
+    ) -> crate::Result<Route<RequestBody, ResponseBody, E>>
     where
         P: Into<String>,
-        H: Fn(Request<hyper::Body>) -> R + Send + Sync + 'static,
-        R: Future<Output = Result<Response<B>, E>> + Send + 'static,
+        H: Fn(Request<RequestBody>) -> R + Send + Sync + 'static,
+        R: Future<Output = Result<Response<ResponseBody>, E>> + Send + 'static,
     {
-        let handler: Handler<B, E> = Box::new(move |req: Request<hyper::Body>| Box::new(handler(req)));
+        let handler: Handler<RequestBody, ResponseBody, E> =
+            Box::new(move |req: Request<RequestBody>| Box::new(handler(req)));
         Route::new_with_boxed_handler(path, methods, handler, 1)
     }
 
@@ -94,7 +108,11 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
         self.methods.contains(method)
     }
 
-    pub(crate) async fn process(&self, target_path: &str, mut req: Request<hyper::Body>) -> crate::Result<Response<B>> {
+    pub(crate) async fn process(
+        &self,
+        target_path: &str,
+        mut req: Request<RequestBody>,
+    ) -> crate::Result<Response<ResponseBody>> {
         self.push_req_meta(target_path, &mut req);
 
         let handler = self
@@ -105,11 +123,11 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
         Pin::from(handler(req)).await.map_err(Into::into)
     }
 
-    fn push_req_meta(&self, target_path: &str, req: &mut Request<hyper::Body>) {
+    fn push_req_meta(&self, target_path: &str, req: &mut Request<RequestBody>) {
         self.update_req_meta(req, self.generate_req_meta(target_path));
     }
 
-    fn update_req_meta(&self, req: &mut Request<hyper::Body>, req_meta: RequestMeta) {
+    fn update_req_meta(&self, req: &mut Request<RequestBody>, req_meta: RequestMeta) {
         helpers::update_req_meta_in_extensions(req.extensions_mut(), req_meta);
     }
 
@@ -136,7 +154,7 @@ impl<B: HttpBody + Send + Sync + 'static, E: Into<Box<dyn std::error::Error + Se
     }
 }
 
-impl<B, E> Debug for Route<B, E> {
+impl<RequestBody, ResponseBody, E> Debug for Route<RequestBody, ResponseBody, E> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
